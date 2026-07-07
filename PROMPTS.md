@@ -43,7 +43,7 @@ Acceptance: actionlint clean; README gains a "verify it yourself" section with t
 ## Prompt 2.4 — GitOps digest-bump PR
 
 ```
-Add the final job: open a PR against <ORG>/platform-gitops updating the image digest for this service (kustomize edit set image or yq against apps/<service-name>/kustomization.yaml — match whatever structure platform-gitops defines; if unsure, write it against a documented assumption and note it).
+Add the final job: open a PR against frhnardi/platform-gitops updating the image digest for this service (kustomize edit set image or yq against apps/<service-name>/kustomization.yaml — match whatever structure platform-gitops defines; if unsure, write it against a documented assumption and note it).
 Auth: use a GitHub App or fine-grained PAT? Neither — propose the least-bad option given our zero-static-credential rule (ADR-0003), present trade-offs (GitHub App installation token vs. repo-scoped fine-grained PAT), and implement the GitHub App path with the app id/private key stored as org secrets, clearly documenting this as the ONE exception to "no secrets" and why it is scoped/acceptable. Update ADR-0003 consequences section via a proposed diff I can copy to platform-infra.
 Acceptance: PR body template includes digest, run link, and SBOM artifact link.
 ```

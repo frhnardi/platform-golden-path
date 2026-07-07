@@ -22,7 +22,7 @@ permissions:          # OIDC + code-scanning upload — GitHub only grants these
   security-events: write
 jobs:
   golden-path:
-    uses: <ORG>/platform-golden-path/.github/workflows/golden-path.yml@<SHA>  # pin to a commit SHA
+    uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>  # pin to a commit SHA
     with:
       service-name: my-service
     secrets: inherit
@@ -102,13 +102,13 @@ attestation. Anyone can verify both:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github\.com/<ORG>/platform-golden-path/\.github/workflows/golden-path\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/frhnardi/platform-golden-path/\.github/workflows/golden-path\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   <acr>.azurecr.io/<service-name>@sha256:<digest>
 
 # and the SBOM attestation:
 cosign verify-attestation --type spdx \
-  --certificate-identity-regexp '^https://github\.com/<ORG>/platform-golden-path/\.github/workflows/golden-path\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/frhnardi/platform-golden-path/\.github/workflows/golden-path\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   <acr>.azurecr.io/<service-name>@sha256:<digest>
 ```
@@ -146,6 +146,6 @@ in `platform-infra/docs/adr/`. If a choice ever surprises you, the ADR is the
 
 Status: Phase 2 — pending Phase 1 completion.
 
-[ADR-0003]: https://github.com/<ORG>/platform-infra/tree/main/docs/adr
-[ADR-0005]: https://github.com/<ORG>/platform-infra/tree/main/docs/adr
-[ADR-0008]: https://github.com/<ORG>/platform-infra/tree/main/docs/adr
+[ADR-0003]: https://github.com/frhnardi/platform-infra/tree/main/docs/adr
+[ADR-0005]: https://github.com/frhnardi/platform-infra/tree/main/docs/adr
+[ADR-0008]: https://github.com/frhnardi/platform-infra/tree/main/docs/adr

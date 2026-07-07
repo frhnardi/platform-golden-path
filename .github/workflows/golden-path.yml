@@ -6,7 +6,7 @@
 #
 #   jobs:
 #     golden-path:
-#       uses: <ORG>/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
+#       uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
 #       with:
 #         service-name: my-service
 #
@@ -55,7 +55,7 @@ on:
           owner/repo of the GitOps repository the promotion PR is opened against.
         required: false
         type: string
-        default: "<ORG>/platform-gitops"
+        default: "frhnardi/platform-gitops"
     secrets:
       # ── THE ONE SANCTIONED EXCEPTION TO ADR-0003 (zero static credentials) ──
       # Cross-repo writes (opening a PR against platform-gitops) cannot use this
@@ -142,7 +142,7 @@ jobs:
             echo
             echo "**NEXT step:** Reproduce locally with \`golangci-lint run\` and \`go test -race ./...\`, fix the reported findings, and push again."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#lint-and-test _(placeholder — TODO: replace with published docs URL)_"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#lint-and-test _(placeholder — TODO: replace with published docs URL)_"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   semgrep-sast:
@@ -189,7 +189,7 @@ jobs:
             echo
             echo "**NEXT step:** Reproduce locally with \`semgrep scan --config p/default --severity ERROR\`, fix the flagged code, and push again. If you believe a finding is a false positive, request an exception instead of suppressing it."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#semgrep-sast _(placeholder — TODO: replace with published docs URL)_"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#semgrep-sast _(placeholder — TODO: replace with published docs URL)_"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   dependency-scan:
@@ -249,7 +249,7 @@ jobs:
             echo
             echo "**NEXT step:** Update the vulnerable module (\`go get <module>@<fixed-version> && go mod tidy\`) — the Trivy table above names the installed and fixed versions. If no fixed version exists yet, request a documented exception."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#trivy-dependency-scan _(placeholder — TODO: replace with published docs URL)_"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#trivy-dependency-scan _(placeholder — TODO: replace with published docs URL)_"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   build-and-push:
@@ -396,7 +396,7 @@ jobs:
             echo
             echo "**NEXT step:** If the image scan failed, update the base image or the vulnerable module named in the Trivy table above — the golden-path template's distroless base rarely flags. If the Azure login failed, verify the AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID / ACR_NAME repository variables and that the app registration's federated credential subject matches this repository and workflow. Then re-run the job."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#build-and-push _(placeholder — TODO: replace with published docs URL)_"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#build-and-push _(placeholder — TODO: replace with published docs URL)_"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   sign-and-attest:
@@ -413,7 +413,7 @@ jobs:
       id-token: write
     # IDENTITY CONTRACT (ADR-0005): because this is a reusable workflow, the
     # certificate identity Fulcio embeds in the signing cert is THIS workflow's
-    # job_workflow_ref (<org>/platform-golden-path/.github/workflows/golden-path.yml@<ref>),
+    # job_workflow_ref (frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<ref>),
     # not the caller's. The Kyverno policy in platform-gitops verifies against a
     # regexp over exactly that identity — if this repository or this file's path
     # ever changes, that policy MUST be updated in the same change set.
@@ -501,7 +501,7 @@ jobs:
             echo
             echo "**NEXT step:** If Fulcio/Rekor returned an error, it is usually transient — re-run this job. If the failure is a registry permission error, verify the federated identity has push rights (AcrPush) on the registry. Do NOT fall back to key-based signing; keyless is the only supported mode."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#sign-and-attest _(placeholder — TODO: replace with published docs URL)_"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#sign-and-attest _(placeholder — TODO: replace with published docs URL)_"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   open-gitops-pr:
@@ -657,5 +657,5 @@ jobs:
             echo
             echo "**NEXT step:** If token minting failed, confirm the GitHub App is installed on \`${GITOPS_REPO}\` with contents:write + pull_requests:write and that GITOPS_APP_ID / GITOPS_APP_PRIVATE_KEY are set as org secrets and inherited. If the kustomization edit failed, the service may not be onboarded in platform-gitops yet (see the error above). Then re-run this job."
             echo
-            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#open-gitops-pr _(placeholder — TODO: replace with published docs URL)_ · setup: docs/gitops-promotion.md"
+            echo "**DOCS:** https://github.com/frhnardi/platform-infra/blob/main/docs/golden-path/troubleshooting.md#open-gitops-pr _(placeholder — TODO: replace with published docs URL)_ · setup: docs/gitops-promotion.md"
           } | tee -a "$GITHUB_STEP_SUMMARY"

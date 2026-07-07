@@ -60,7 +60,7 @@ actually act is ephemeral and minimal.
    ```yaml
    jobs:
      golden-path:
-       uses: <ORG>/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
+       uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
        with:
          service-name: my-service
        secrets: inherit
