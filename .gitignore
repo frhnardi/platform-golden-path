@@ -1,0 +1,11 @@
+# Go build artifacts from the service template (source is committed, builds are not).
+/templates/service-go/service
+*.exe
+*.test
+*.out
+
+# Local tooling / act runner state.
+.act/
+
+# OS / editor cruft.
+.DS_Store

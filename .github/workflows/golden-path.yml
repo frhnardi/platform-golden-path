@@ -1,0 +1,661 @@
+# golden-path.yml — the paved road, stages 1–5
+# (lint/test → SAST → dependency scan → build, image scan, SBOM, push to ACR
+#  → keyless sign + SBOM attestation).
+#
+# Reusable workflow (workflow_call). Consumer repos invoke it with ~5 lines of YAML:
+#
+#   jobs:
+#     golden-path:
+#       uses: <ORG>/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
+#       with:
+#         service-name: my-service
+#
+# Consumer repos must also define four non-sensitive repository variables
+# (Settings → Secrets and variables → Actions → Variables) — no secrets, ever
+# (ADR-0003): AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, ACR_NAME.
+#
+# Pipeline order is fixed by ADR-0008; severity gates (Semgrep HIGH, Trivy CRITICAL)
+# are policy, not suggestion (ADR-0005/ADR-0008). Findings below the gate are still
+# reported to GitHub code scanning via SARIF, but do not block the build.
+#
+# Outputs: the build-and-push job exports the pushed image's immutable digest
+# (see the job's `outputs:` block); downstream stages and callers must reference
+# the image by digest, never by tag.
+#
+# Every third-party action is pinned to a full commit SHA (supply-chain hygiene);
+# the trailing comment records the tag the SHA was resolved from.
+
+name: Golden Path — lint, test, and security-scan a service
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: >-
+          Name of the service being built. Used in log/failure messages now and
+          for image naming in later stages.
+        required: true
+        type: string
+      language:
+        description: >-
+          Implementation language of the service. Only "go" is supported today;
+          adding a language requires an ADR in platform-infra/docs/adr/.
+        required: false
+        type: string
+        default: "go"
+      dockerfile-path:
+        description: >-
+          Path to the service Dockerfile, relative to the repository root.
+          Consumed by the build-and-push stage.
+        required: false
+        type: string
+        default: "./Dockerfile"
+      gitops-repo:
+        description: >-
+          owner/repo of the GitOps repository the promotion PR is opened against.
+        required: false
+        type: string
+        default: "<ORG>/platform-gitops"
+    secrets:
+      # ── THE ONE SANCTIONED EXCEPTION TO ADR-0003 (zero static credentials) ──
+      # Cross-repo writes (opening a PR against platform-gitops) cannot use this
+      # workflow's OIDC token — GitHub OIDC only authenticates to third parties
+      # like Azure/Fulcio, never back to the GitHub API of another repo. Some
+      # long-lived credential is unavoidable. We minimise the blast radius by
+      # using a GitHub App: the only stored secret is the App's private key
+      # (rotatable, one place, org-owned). At runtime it mints an installation
+      # token that is short-lived (~1h) and scoped to just platform-gitops with
+      # only contents:write + pull_requests:write. See docs/gitops-promotion.md
+      # and the ADR-0003 consequences update for the full rationale and the
+      # trade-off against a fine-grained PAT.
+      GITOPS_APP_ID:
+        description: >-
+          App ID of the "golden-path GitOps promoter" GitHub App. Not truly
+          secret (App IDs are semi-public) but kept alongside the key for one
+          onboarding story. Provide as an ORG secret; consumers forward it with
+          `secrets: inherit`.
+        required: false
+      GITOPS_APP_PRIVATE_KEY:
+        description: >-
+          PEM private key of the GitOps promoter GitHub App. THE ONLY static
+          secret in the entire golden path (documented ADR-0003 exception).
+          Provide as an ORG secret; consumers forward it with `secrets: inherit`.
+        required: false
+    outputs:
+      image-digest:
+        description: >-
+          Immutable manifest digest of the pushed image ("sha256:…"). Everything
+          downstream must reference the image by this digest, never by tag.
+        value: ${{ jobs.build-and-push.outputs.image-digest }}
+      image-ref-by-digest:
+        description: >-
+          Full pull spec pinned by digest,
+          "<acr>.azurecr.io/<service-name>@sha256:…" — the only form that may
+          appear in deployment manifests (platform-gitops).
+        value: ${{ jobs.build-and-push.outputs.image-ref-by-digest }}
+      gitops-pr-url:
+        description: URL of the promotion PR opened against platform-gitops.
+        value: ${{ jobs.open-gitops-pr.outputs.pr-url }}
+
+jobs:
+  lint-and-test:
+    name: Lint the code and run the unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Stop early if the requested language is not supported by the golden path
+        if: inputs.language != 'go'
+        env:
+          REQUESTED_LANGUAGE: ${{ inputs.language }}
+        run: |
+          echo "::error title=Unsupported language::The golden path currently supports only 'go'; got '${REQUESTED_LANGUAGE}'."
+          echo "Supporting a new language requires an ADR in platform-infra/docs/adr/ (see CLAUDE.md / ADR-0008)."
+          exit 1
+
+      - name: Check out the service source code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go using the version declared in go.mod
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Lint the code with golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+
+      - name: Run the unit tests with the race detector enabled
+        run: go test -race ./...
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: lint and unit tests"
+            echo
+            echo "**WHAT failed:** Linting (golangci-lint) or the unit test suite failed for service \`${SERVICE_NAME}\`. Scroll up to the first red step for the exact finding."
+            echo
+            echo "**WHY it matters:** The golden path only promotes code that passes static analysis and its own tests — a broken build here means the security scans and image build never ran, so nothing was published."
+            echo
+            echo "**NEXT step:** Reproduce locally with \`golangci-lint run\` and \`go test -race ./...\`, fix the reported findings, and push again."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#lint-and-test _(placeholder — TODO: replace with published docs URL)_"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  semgrep-sast:
+    name: Scan the source code for security bugs with Semgrep
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload SARIF results to GitHub code scanning
+      actions: read # required by codeql-action/upload-sarif on private repositories
+    steps:
+      - name: Check out the service source code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install the pinned Semgrep release
+        run: pipx install semgrep==1.168.0
+
+      - name: Scan the source with the Semgrep community ruleset and record every finding as SARIF
+        run: semgrep scan --config p/default --metrics=off --sarif --output semgrep.sarif
+
+      - name: Upload the Semgrep findings to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-sast
+
+      # Semgrep's ERROR severity is what the registry assigns to HIGH-and-above
+      # findings; this is the "fail on HIGH" gate from ADR-0008.
+      - name: Fail the build if Semgrep found any HIGH-severity issue (severity gate)
+        run: semgrep scan --config p/default --metrics=off --severity ERROR --error --quiet
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: Semgrep static analysis (SAST)"
+            echo
+            echo "**WHAT failed:** Semgrep found at least one HIGH-severity security issue in the source of \`${SERVICE_NAME}\` (or the scan itself errored). The full finding list, including non-blocking lower severities, is in the repository's Security → Code scanning tab."
+            echo
+            echo "**WHY it matters:** HIGH-severity SAST findings are exploitable code patterns (injection, broken auth, unsafe deserialization, …). The severity gate is platform policy (ADR-0008) — raising the threshold to get a green build requires a documented exception, not a workflow edit."
+            echo
+            echo "**NEXT step:** Reproduce locally with \`semgrep scan --config p/default --severity ERROR\`, fix the flagged code, and push again. If you believe a finding is a false positive, request an exception instead of suppressing it."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#semgrep-sast _(placeholder — TODO: replace with published docs URL)_"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  dependency-scan:
+    name: Scan the dependencies for known vulnerabilities with Trivy
+    needs: semgrep-sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload SARIF results to GitHub code scanning
+      actions: read # required by codeql-action/upload-sarif on private repositories
+    steps:
+      - name: Check out the service source code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The SARIF report deliberately carries ALL severities so lower findings
+      # are visible in code scanning; only the gate step below blocks the build.
+      - name: Scan the repository filesystem with Trivy and record every finding as SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: '0'
+
+      - name: Upload the Trivy findings to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-filesystem
+
+      - name: Fail the build if Trivy found a CRITICAL vulnerability (severity gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+          skip-setup-trivy: true
+        env:
+          # The report step above already downloaded today's vulnerability DB.
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: Trivy dependency scan (SCA)"
+            echo
+            echo "**WHAT failed:** Trivy found at least one CRITICAL vulnerability in the dependencies of \`${SERVICE_NAME}\` (or the scan itself errored). The full finding list, including non-blocking lower severities, is in the repository's Security → Code scanning tab."
+            echo
+            echo "**WHY it matters:** CRITICAL CVEs in dependencies are the most common real-world entry point for supply-chain attacks; shipping one means every image built from this repo carries it. The severity gate is platform policy (ADR-0008)."
+            echo
+            echo "**NEXT step:** Update the vulnerable module (\`go get <module>@<fixed-version> && go mod tidy\`) — the Trivy table above names the installed and fixed versions. If no fixed version exists yet, request a documented exception."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#trivy-dependency-scan _(placeholder — TODO: replace with published docs URL)_"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build-and-push:
+    name: Build the container image, scan it, and push it to ACR
+    needs: dependency-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # federate the workflow's OIDC token to Azure — zero static credentials (ADR-0003)
+    # Job outputs — the contract for downstream stages (cosign sign/attest, the
+    # platform-gitops PR) and for callers via the workflow_call outputs above:
+    #
+    #   image-digest        — the immutable manifest digest of the pushed image,
+    #                         e.g. "sha256:4b825dc642cb6eb9a060e54bf8d69288fbee4904…"
+    #   image-ref-by-digest — the full pull spec pinned by digest,
+    #                         e.g. "myacr.azurecr.io/my-service@sha256:4b825dc6…"
+    #   sbom-artifact-url   — GitHub UI URL of the uploaded SPDX SBOM, so the
+    #                         GitOps promotion PR can link straight to it.
+    #
+    # The "sha-<short-sha>" tag exists only as a human-friendly label in the
+    # registry UI. Deployment manifests and signing MUST use the digest form —
+    # tags are mutable and cannot be trusted (CLAUDE.md).
+    outputs:
+      image-digest: ${{ steps.digest.outputs.image-digest }}
+      image-ref-by-digest: ${{ steps.digest.outputs.image-ref-by-digest }}
+      sbom-artifact-url: ${{ steps.sbom-upload.outputs.artifact-url }}
+    steps:
+      - name: Stop early if the Azure OIDC and ACR repository variables are not configured
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          missing=""
+          for required_var in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ACR_NAME; do
+            [ -n "${!required_var}" ] || missing="${missing} ${required_var}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error title=Missing repository variables::The golden path needs these GitHub repository variables:${missing}."
+            echo "These are non-sensitive identifiers, not secrets (ADR-0003 — zero static credentials)."
+            echo "Set them in the repository (or organization) under Settings → Secrets and variables → Actions → Variables, then re-run."
+            exit 1
+          fi
+
+      - name: Check out the service source code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Compute the image tag from the ACR name, service name, and commit SHA
+        id: image
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          echo "ref=${ACR_NAME}.azurecr.io/${SERVICE_NAME}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx for the image build
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the container image locally — it is only pushed after it passes the image scan
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ inputs.dockerfile-path }}
+          tags: ${{ steps.image.outputs.ref }}
+          load: true
+          push: false
+
+      - name: Fail the build if the image contains a CRITICAL vulnerability (severity gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+      - name: Generate a software bill of materials for the image with Syft (SPDX JSON)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.image.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Upload the SBOM as a build artifact
+        id: sbom-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.service-name }}-sbom.spdx.json
+          path: sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Log in to Azure by federating this workflow's OIDC token (no secrets involved)
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to the Azure Container Registry with the federated identity
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Push the scanned image to the registry
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: docker push "$IMAGE_REF"
+
+      - name: Capture the pushed image digest — downstream must reference the digest, never the tag
+        id: digest
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d'@' -f2)"
+          case "$digest" in
+            sha256:*) ;;
+            *)
+              echo "::error title=Digest capture failed::docker inspect returned '${digest}' instead of a sha256 digest for ${IMAGE_REF} after push."
+              exit 1
+              ;;
+          esac
+          image_ref_by_digest="${IMAGE_REF%:*}@${digest}"
+          {
+            echo "image-digest=${digest}"
+            echo "image-ref-by-digest=${image_ref_by_digest}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pushed and pinned: ${image_ref_by_digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: build, image scan, or push to ACR"
+            echo
+            echo "**WHAT failed:** The image build, the Trivy image scan, SBOM generation, or the push to ACR failed for service \`${SERVICE_NAME}\`. The first red step above names the culprit."
+            echo
+            echo "**WHY it matters:** The registry must only ever receive images that were scanned and are traceable — a CRITICAL CVE in the image (often the base layer) violates the ADR-0008 gate, and a failed digest capture would leave deployments pinned to nothing. Nothing was pushed unless every step before the push succeeded."
+            echo
+            echo "**NEXT step:** If the image scan failed, update the base image or the vulnerable module named in the Trivy table above — the golden-path template's distroless base rarely flags. If the Azure login failed, verify the AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID / ACR_NAME repository variables and that the app registration's federated credential subject matches this repository and workflow. Then re-run the job."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#build-and-push _(placeholder — TODO: replace with published docs URL)_"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  sign-and-attest:
+    name: Sign the image and attest its SBOM keylessly with cosign
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # id-token: write serves two purposes here (ADR-0005 / ADR-0003):
+      #   1. Fulcio exchanges this workflow's OIDC token for the short-lived
+      #      signing certificate — keyless, no cosign key pair exists anywhere.
+      #   2. azure/login federates the same OIDC identity to push the signature
+      #      and attestation blobs to ACR.
+      id-token: write
+    # IDENTITY CONTRACT (ADR-0005): because this is a reusable workflow, the
+    # certificate identity Fulcio embeds in the signing cert is THIS workflow's
+    # job_workflow_ref (<org>/platform-golden-path/.github/workflows/golden-path.yml@<ref>),
+    # not the caller's. The Kyverno policy in platform-gitops verifies against a
+    # regexp over exactly that identity — if this repository or this file's path
+    # ever changes, that policy MUST be updated in the same change set.
+    steps:
+      - name: Install cosign so the pipeline can sign keylessly
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download the SBOM produced by the build stage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.service-name }}-sbom.spdx.json
+
+      - name: Log in to Azure by federating this workflow's OIDC token (no secrets involved)
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to the Azure Container Registry so cosign can push the signature
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Sign the image by digest with cosign, keyless via GitHub OIDC
+        env:
+          IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
+        run: cosign sign --yes "$IMAGE_REF_BY_DIGEST"
+
+      - name: Attach the SBOM to the image as a signed attestation
+        env:
+          IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
+        run: cosign attest --yes --predicate sbom.spdx.json --type spdx "$IMAGE_REF_BY_DIGEST"
+
+      - name: Print the exact verification commands that platform-gitops will enforce
+        env:
+          IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
+        run: |
+          # No github-context property exposes a reusable workflow's own ref, so
+          # read the job_workflow_ref claim from a fresh OIDC token — this is the
+          # exact value Fulcio embeds as the certificate identity (SAN).
+          token="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value')"
+          JOB_WORKFLOW_REF="$(printf '%s' "$token" | cut -d. -f2 | python3 -c "import base64,json,sys; p=sys.stdin.read().strip(); p+='='*(-len(p)%4); print(json.loads(base64.urlsafe_b64decode(p))['job_workflow_ref'])")"
+          # The SAN is https://github.com/<job_workflow_ref>; pin the regexp to
+          # the workflow path and allow any ref after the "@".
+          workflow_path="${JOB_WORKFLOW_REF%@*}"
+          escaped_path="$(printf '%s' "$workflow_path" | sed 's/\./\\./g')"
+          identity_regexp="^https://github\\.com/${escaped_path}@"
+          {
+            echo "## ✅ Image signed and SBOM attested — keyless (ADR-0005)"
+            echo
+            echo "**Signed artifact:** \`${IMAGE_REF_BY_DIGEST}\`"
+            echo
+            echo "**Certificate identity (Fulcio SAN):** \`https://github.com/${JOB_WORKFLOW_REF}\`"
+            echo
+            echo "### Verify it yourself"
+            echo
+            echo '```bash'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp '${identity_regexp}' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE_REF_BY_DIGEST}"
+            echo
+            echo "# and the SBOM attestation:"
+            echo "cosign verify-attestation --type spdx \\"
+            echo "  --certificate-identity-regexp '${identity_regexp}' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE_REF_BY_DIGEST}"
+            echo '```'
+            echo
+            echo "> ⚠️ **The identity regexp above is the enforcement contract.** The Kyverno policy in \`platform-gitops\` admits only images whose signing certificate matches this identity. If this workflow's repository or file path ever changes, that policy must be updated in the same change set (ADR-0005)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: keyless signing / SBOM attestation"
+            echo
+            echo "**WHAT failed:** cosign could not sign the image or attach the SBOM attestation for service \`${SERVICE_NAME}\` (or the Azure/ACR login for pushing the signature failed). The first red step above names the culprit."
+            echo
+            echo "**WHY it matters:** Unsigned images are undeployable by design — the Kyverno admission policy in \`platform-gitops\` rejects any image without a valid keyless signature from this workflow's identity (ADR-0005). The image was already pushed, but it cannot reach a cluster until signing succeeds."
+            echo
+            echo "**NEXT step:** If Fulcio/Rekor returned an error, it is usually transient — re-run this job. If the failure is a registry permission error, verify the federated identity has push rights (AcrPush) on the registry. Do NOT fall back to key-based signing; keyless is the only supported mode."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#sign-and-attest _(placeholder — TODO: replace with published docs URL)_"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  open-gitops-pr:
+    name: Open a PR against platform-gitops bumping the image digest
+    # Runs last in the fixed pipeline (CLAUDE.md / ADR-0008): only a signed,
+    # attested image gets promoted. sign-and-attest already depends on
+    # build-and-push, but build-and-push is listed explicitly here too so this
+    # job can read its outputs (digest, image ref, SBOM URL).
+    needs: [build-and-push, sign-and-attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This job does NOT use the workflow's OIDC token or GITHUB_TOKEN to write —
+    # cross-repo writes go through a scoped GitHub App installation token minted
+    # below. The workflow token stays read-only.
+    permissions:
+      contents: read
+    outputs:
+      pr-url: ${{ steps.pr.outputs.pull-request-url }}
+    steps:
+      - name: Stop early if the GitOps App credentials are not configured
+        env:
+          GITOPS_APP_ID: ${{ secrets.GITOPS_APP_ID }}
+          GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GITOPS_APP_ID" ] || [ -z "$GITOPS_APP_PRIVATE_KEY" ]; then
+            echo "::error title=Missing GitOps App credentials::The final stage needs the GITOPS_APP_ID and GITOPS_APP_PRIVATE_KEY secrets to open the promotion PR."
+            echo "These are the ONE sanctioned exception to ADR-0003 (zero static credentials) — the GitHub App private key. Store them as ORG secrets and forward them from the caller with 'secrets: inherit'."
+            echo "Setup steps: docs/gitops-promotion.md. Everything else (build, scan, sign, push) already ran; only the promotion PR is blocked."
+            exit 1
+          fi
+
+      - name: Resolve the GitOps repository owner, name, and promotion branch
+        id: gitops
+        env:
+          GITOPS_REPO: ${{ inputs.gitops-repo }}
+          SERVICE_NAME: ${{ inputs.service-name }}
+          DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+        run: |
+          # A git branch name may not contain ':', so drop the "sha256:" prefix
+          # and use the first 12 hex chars — one branch (one PR) per new digest.
+          digest_hex="${DIGEST#sha256:}"
+          {
+            echo "owner=${GITOPS_REPO%%/*}"
+            echo "name=${GITOPS_REPO##*/}"
+            echo "branch=promote/${SERVICE_NAME}/${digest_hex:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint a short-lived, platform-gitops-scoped GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: ${{ steps.gitops.outputs.owner }}
+          repositories: ${{ steps.gitops.outputs.name }}
+
+      - name: Check out platform-gitops with the scoped App token
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: Pin the new image digest in the service's kustomization (never a tag)
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+          NEW_NAME: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
+          DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+        run: |
+          # ── DOCUMENTED ASSUMPTION about platform-gitops layout ──────────────
+          # Each service lives at apps/<service-name>/kustomization.yaml, whose
+          # images: list has an entry keyed by `name: <service-name>`. We set its
+          # newName (ACR path) + digest and delete any newTag, so the manifest is
+          # only ever pinned by digest. If platform-gitops uses a different
+          # layout, adjust this step (and the note in docs/gitops-promotion.md).
+          #
+          # Equivalent with kustomize, if the repo standardises on it:
+          #   (cd "gitops/apps/${SERVICE_NAME}" \
+          #     && kustomize edit set image "${SERVICE_NAME}=${NEW_NAME}")
+          # (NEW_NAME already includes @sha256:… so kustomize records the digest.)
+          kustomization="gitops/apps/${SERVICE_NAME}/kustomization.yaml"
+          if [ ! -f "$kustomization" ]; then
+            echo "::error title=Service not onboarded in platform-gitops::Expected ${kustomization} to exist. Onboard the service in platform-gitops (add apps/${SERVICE_NAME}/) before the golden path can promote it."
+            exit 1
+          fi
+          # NEW_NAME is "<acr>/<service>@sha256:…"; the images entry wants newName
+          # without the digest, and digest carried separately.
+          new_name_no_digest="${NEW_NAME%@*}"
+          NEW_NAME_NO_DIGEST="$new_name_no_digest" \
+          yq -i '
+            (.images[] | select(.name == strenv(SERVICE_NAME)))
+              |= (.newName = strenv(NEW_NAME_NO_DIGEST) | .digest = strenv(DIGEST) | del(.newTag))
+          ' "$kustomization"
+          # Fail loudly if the entry was absent (yq would have silently no-op'd).
+          written="$(yq '.images[] | select(.name == strenv(SERVICE_NAME)) | .digest' "$kustomization")"
+          if [ "$written" != "$DIGEST" ]; then
+            echo "::error title=Digest not written::No images entry named '${SERVICE_NAME}' in ${kustomization}; nothing was updated. Add that entry in platform-gitops so promotions can pin it."
+            exit 1
+          fi
+
+      - name: Open (or update) the promotion PR against platform-gitops
+        id: pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          branch: ${{ steps.gitops.outputs.branch }}
+          delete-branch: true
+          sign-commits: true
+          commit-message: "chore(${{ inputs.service-name }}): promote image to ${{ needs.build-and-push.outputs.image-digest }}"
+          title: "Promote ${{ inputs.service-name }} → ${{ needs.build-and-push.outputs.image-digest }}"
+          labels: |
+            golden-path
+            image-promotion
+          body: |
+            ## 🚀 Automated image promotion — golden path
+
+            The golden-path pipeline built, scanned, signed, and attested a new
+            image for **`${{ inputs.service-name }}`** and proposes to promote it
+            by pinning the digest below. Merging lets the GitOps reconciler roll it out.
+
+            | | |
+            |---|---|
+            | **Service** | `${{ inputs.service-name }}` |
+            | **Image (pinned by digest)** | `${{ needs.build-and-push.outputs.image-ref-by-digest }}` |
+            | **Digest** | `${{ needs.build-and-push.outputs.image-digest }}` |
+            | **Pipeline run** | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+            | **SBOM (SPDX JSON)** | ${{ needs.build-and-push.outputs.sbom-artifact-url }} |
+
+            This image is signed **keylessly** and its SBOM is attested (ADR-0005).
+            The exact `cosign verify` command — with the certificate-identity
+            regexp Kyverno enforces — is printed in the pipeline run's
+            **sign-and-attest** job summary (linked above). Verify before merging.
+
+            > Admission is gated by Kyverno on the signing identity; an unsigned or
+            > wrongly-identified image is rejected at the cluster. This PR changes
+            > only the digest — review the diff, confirm the run is green, verify
+            > the signature, then merge.
+
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+          GITOPS_REPO: ${{ inputs.gitops-repo }}
+        run: |
+          {
+            echo "## ❌ Golden path failed at: open promotion PR against platform-gitops"
+            echo
+            echo "**WHAT failed:** The pipeline could not open the digest-bump PR against \`${GITOPS_REPO}\` for service \`${SERVICE_NAME}\` — App token minting, the platform-gitops checkout, the kustomization edit, or PR creation. The first red step above names the culprit."
+            echo
+            echo "**WHY it matters:** The image is already built, scanned, signed, and pushed — but nothing deploys until its digest lands in GitOps. This is the promotion handoff; a failure here means the new version simply will not roll out."
+            echo
+            echo "**NEXT step:** If token minting failed, confirm the GitHub App is installed on \`${GITOPS_REPO}\` with contents:write + pull_requests:write and that GITOPS_APP_ID / GITOPS_APP_PRIVATE_KEY are set as org secrets and inherited. If the kustomization edit failed, the service may not be onboarded in platform-gitops yet (see the error above). Then re-run this job."
+            echo
+            echo "**DOCS:** https://github.com/<ORG>/platform-infra/blob/main/docs/golden-path/troubleshooting.md#open-gitops-pr _(placeholder — TODO: replace with published docs URL)_ · setup: docs/gitops-promotion.md"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
