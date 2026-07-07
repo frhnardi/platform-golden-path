@@ -1,0 +1,16 @@
+name: CI
+on: [push, pull_request]
+# OIDC (Azure login, cosign keyless) and SARIF upload can only be granted by the
+# caller — GitHub will not let the reusable workflow elevate these itself.
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+  security-events: write
+jobs:
+  golden-path:
+    uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@main
+    with:
+      service-name: my-python-service
+      language: python
+    secrets: inherit  # nosemgrep: secrets-inherit — sanctioned ADR-0003 exception for GitOps App key forwarding

@@ -10,27 +10,40 @@ this just explains what happens after you push.
 ## Quickstart
 
 Either click **Use this template** on [`templates/service-go`](templates/service-go)
-(it ships with this wired up), or drop this file into your repo at
-`.github/workflows/ci.yml`:
+or [`templates/service-python`](templates/service-python) (they ship with this
+wired up), or drop this file into your repo at `.github/workflows/ci.yml`:
 
 ```yaml
+# Go (default):
 name: CI
 on: [push, pull_request]
-permissions:          # OIDC + code-scanning upload — GitHub only grants these from the caller
+permissions:
   contents: read
   id-token: write
+  actions: read
   security-events: write
 jobs:
   golden-path:
-    uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>  # pin to a commit SHA
+    uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
     with:
       service-name: my-service
     secrets: inherit
 ```
 
-The call itself is five lines (`uses:` → `secrets: inherit`). The rest is the
-boilerplate GitHub requires: event triggers, and the permissions that OIDC
-signing and SARIF upload can only be granted from the calling workflow.
+```yaml
+# Python — add language: python:
+  golden-path:
+    uses: frhnardi/platform-golden-path/.github/workflows/golden-path.yml@<SHA>
+    with:
+      service-name: my-python-service
+      language: python
+    secrets: inherit
+```
+
+The call itself is ~15 lines for Go, ~15 lines for Python (`uses:` →
+`secrets: inherit`). The rest is the boilerplate GitHub requires: event triggers,
+and the permissions that OIDC signing and SARIF upload can only be granted from
+the calling workflow.
 
 **What your org provides once, so you don't have to:** the Azure/ACR identifiers
 as repository *variables* (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,

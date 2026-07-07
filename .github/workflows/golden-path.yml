@@ -106,11 +106,11 @@ jobs:
       contents: read
     steps:
       - name: Stop early if the requested language is not supported by the golden path
-        if: inputs.language != 'go'
+        if: inputs.language != 'go' && inputs.language != 'python'
         env:
           REQUESTED_LANGUAGE: ${{ inputs.language }}
         run: |
-          echo "::error title=Unsupported language::The golden path currently supports only 'go'; got '${REQUESTED_LANGUAGE}'."
+          echo "::error title=Unsupported language::The golden path supports go and python; got '${REQUESTED_LANGUAGE}'."
           echo "Supporting a new language requires an ADR in platform-infra/docs/adr/ (see CLAUDE.md / ADR-0008)."
           exit 1
 
@@ -118,31 +118,44 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go using the version declared in go.mod
+        if: inputs.language == 'go'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@a42ce7df3ff263be9b3e0c49ce80b3f4a0a1b4e5 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        if: inputs.language == 'python'
+        run: pip install ruff pytest httpx
+
+
       - name: Lint the code with golangci-lint
+        if: inputs.language == 'go'
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          # Pin the linter itself, not just the action (CLAUDE.md: pin everything).
-          # An unpinned version floats to the latest release, so a new linter or
-          # a stricter check silently breaks every consumer's build with no code
-          # change. Bump this deliberately, in a reviewed commit.
           version: v2.12.2
 
       - name: Run the unit tests with the race detector enabled
+        if: inputs.language == 'go'
         run: go test -race ./...
 
-      - name: Explain what failed, why it matters, and what to do next
-        if: failure()
-        env:
-          SERVICE_NAME: ${{ inputs.service-name }}
-        run: |
+      - name: Lint the code with ruff
+        if: inputs.language == 'python'
+        run: ruff check .
+
+      - name: Run the unit tests with pytest
+        if: inputs.language == 'python'
+        run: pytest
+
           {
             echo "## ❌ Golden path failed at: lint and unit tests"
             echo
-            echo "**WHAT failed:** Linting (golangci-lint) or the unit test suite failed for service \`${SERVICE_NAME}\`. Scroll up to the first red step for the exact finding."
+            echo "**WHAT failed:** Linting (ruff or golangci-lint, or pytest or go test suite failed for service \`${SERVICE_NAME}\`. Scroll up to the first red step for the exact finding."
             echo
             echo "**WHY it matters:** The golden path only promotes code that passes static analysis and its own tests — a broken build here means the security scans and image build never ran, so nothing was published."
             echo

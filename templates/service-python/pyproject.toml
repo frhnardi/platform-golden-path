@@ -1,0 +1,29 @@
+[project]
+name = "golden-path-python-service"
+version = "0.1.0"
+description = "A Python service on the golden path"
+requires-python = ">=3.12"
+
+[tool.ruff]
+# Target Python 3.12 — the same version the distroless runtime ships.
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["*_test.py"]
+addopts = ["-v", "--tb=short"]
