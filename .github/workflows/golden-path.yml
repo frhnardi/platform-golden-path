@@ -152,6 +152,11 @@ jobs:
         if: inputs.language == 'python'
         run: pytest
 
+      - name: Explain what failed, why it matters, and what to do next
+        if: failure()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+        run: |
           {
             echo "## ❌ Golden path failed at: lint and unit tests"
             echo
@@ -298,6 +303,10 @@ jobs:
       image-digest: ${{ steps.digest.outputs.image-digest }}
       image-ref-by-digest: ${{ steps.digest.outputs.image-ref-by-digest }}
       sbom-artifact-url: ${{ steps.sbom-upload.outputs.artifact-url }}
+      # t0 for the DORA lead-time measurement — the source commit's time. The
+      # promotion PR stamps it onto the workload; the DORA exporter subtracts it
+      # from the pod's Ready time to get lead-time-for-changes (see ADR-0011).
+      committed-at: ${{ steps.commit-meta.outputs.committed-at }}
     steps:
       - name: Stop early if the Azure OIDC and ACR repository variables are not configured
         env:
@@ -319,6 +328,16 @@ jobs:
 
       - name: Check out the service source code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Record the source commit time — t0 for the DORA lead-time measurement
+        id: commit-meta
+        run: |
+          # %cI = strict ISO-8601 committer date. The promotion PR stamps this
+          # onto the workload as an annotation; the DORA exporter reads it back
+          # and subtracts it from the pod's Ready time (ADR-0011). fetch-depth 1
+          # is enough — we only need HEAD's own commit time.
+          committed_at="$(git show -s --format=%cI HEAD)"
+          echo "committed-at=${committed_at}" >> "$GITHUB_OUTPUT"
 
       - name: Compute the image tag from the ACR name, service name, and commit SHA
         id: image
@@ -594,6 +613,7 @@ jobs:
           SERVICE_NAME: ${{ inputs.service-name }}
           NEW_NAME: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
           DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+          COMMITTED_AT: ${{ needs.build-and-push.outputs.committed-at }}
         run: |
           # ── DOCUMENTED ASSUMPTION about platform-gitops layout ──────────────
           # Each service lives at apps/<service-name>/kustomization.yaml, whose
@@ -625,6 +645,16 @@ jobs:
             echo "::error title=Digest not written::No images entry named '${SERVICE_NAME}' in ${kustomization}; nothing was updated. Add that entry in platform-gitops so promotions can pin it."
             exit 1
           fi
+
+          # Stamp DORA provenance as commonAnnotations: kustomize propagates these
+          # onto the Deployment's metadata, where the DORA exporter reads them to
+          # measure lead time (commit -> running pod) and deployment frequency
+          # (ADR-0011). commit-sha is what the exporter keys "a new rollout" on.
+          COMMIT_SHA="${GITHUB_SHA}" \
+          yq -i '
+            .commonAnnotations."paved-road.platform/commit-sha" = strenv(COMMIT_SHA) |
+            .commonAnnotations."paved-road.platform/commit-timestamp" = strenv(COMMITTED_AT)
+          ' "$kustomization"
 
       - name: Open (or update) the promotion PR against platform-gitops
         id: pr
