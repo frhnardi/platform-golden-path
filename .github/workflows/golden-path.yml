@@ -129,9 +129,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python test dependencies
+      - name: Install Python dependencies (the service's own, plus the test tooling)
         if: inputs.language == 'python'
-        run: pip install ruff pytest httpx
+        run: |
+          # The service's runtime deps must be installed so pytest can import the
+          # app under test (e.g. `from main import app`); the previous version
+          # installed only the tooling, so any real import failed to collect.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install ruff pytest httpx
 
 
       - name: Lint the code with golangci-lint
