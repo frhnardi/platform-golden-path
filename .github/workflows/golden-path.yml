@@ -490,6 +490,54 @@ jobs:
           IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
         run: cosign attest --yes --predicate sbom.spdx.json --type spdx "$IMAGE_REF_BY_DIGEST"
 
+      - name: Generate SLSA build provenance and attach it as a signed attestation
+        # Signature = who; SBOM = what; provenance = HOW and from what source.
+        # The predicate names THIS workflow as the builder (from the OIDC
+        # job_workflow_ref, the same identity Fulcio embeds) and pins the source
+        # repo + commit. Kyverno's verify-provenance policy in platform-gitops
+        # then admits only images whose provenance is signed by this identity.
+        env:
+          IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
+          SERVICE_NAME: ${{ inputs.service-name }}
+          SOURCE_REPO: ${{ github.server_url }}/${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # job_workflow_ref names the reusable workflow that actually ran — the
+          # builder identity. No github-context property exposes it, so read the
+          # claim from a fresh OIDC token (same trick as the verify step below).
+          token="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value')"
+          job_workflow_ref="$(printf '%s' "$token" | cut -d. -f2 | python3 -c "import base64,json,sys; p=sys.stdin.read().strip(); p+='='*(-len(p)%4); print(json.loads(base64.urlsafe_b64decode(p))['job_workflow_ref'])")"
+          started_on="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # SLSA v1.0 provenance predicate. cosign wraps it in an in-toto
+          # statement (predicateType https://slsa.dev/provenance/v1) bound to the
+          # image digest.
+          jq -n \
+            --arg buildType "https://github.com/frhnardi/platform-golden-path/golden-path@v1" \
+            --arg builderId "https://github.com/${job_workflow_ref}" \
+            --arg repo "$SOURCE_REPO" \
+            --arg ref "$SOURCE_REF" \
+            --arg sha "$SOURCE_SHA" \
+            --arg service "$SERVICE_NAME" \
+            --arg runUrl "$RUN_URL" \
+            --arg startedOn "$started_on" \
+            '{
+              buildDefinition: {
+                buildType: $buildType,
+                externalParameters: { service: $service, sourceRef: $ref },
+                internalParameters: {},
+                resolvedDependencies: [ { uri: ("git+" + $repo + "@" + $ref), digest: { gitCommit: $sha } } ]
+              },
+              runDetails: {
+                builder: { id: $builderId },
+                metadata: { invocationId: $runUrl, startedOn: $startedOn }
+              }
+            }' > provenance.json
+
+          cosign attest --yes --type slsaprovenance1 --predicate provenance.json "$IMAGE_REF_BY_DIGEST"
+
       - name: Print the exact verification commands that platform-gitops will enforce
         env:
           IMAGE_REF_BY_DIGEST: ${{ needs.build-and-push.outputs.image-ref-by-digest }}
@@ -519,8 +567,14 @@ jobs:
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
             echo "  ${IMAGE_REF_BY_DIGEST}"
             echo
-            echo "# and the SBOM attestation:"
+            echo "# the SBOM attestation:"
             echo "cosign verify-attestation --type spdx \\"
+            echo "  --certificate-identity-regexp '${identity_regexp}' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE_REF_BY_DIGEST}"
+            echo
+            echo "# and the SLSA build provenance:"
+            echo "cosign verify-attestation --type slsaprovenance1 \\"
             echo "  --certificate-identity-regexp '${identity_regexp}' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
             echo "  ${IMAGE_REF_BY_DIGEST}"
