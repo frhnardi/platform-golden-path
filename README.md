@@ -7,6 +7,41 @@ knowledge required and no tickets to file. This README is for you, the developer
 adopting it. You do not need to understand Sigstore or Kyverno to use the road;
 this just explains what happens after you push.
 
+## Deploy your first app in 5 minutes
+
+A hands-on checklist (assumes the platform — infra + gitops — is already up):
+
+1. **Start from a template.** Click *Use this template* on
+   [`templates/service-go`](templates/service-go) (Go) or
+   [`templates/service-python`](templates/service-python) (Python). You get a
+   working service plus the ~5-line CI already wired.
+2. **Set four repository variables** (Settings → Secrets and variables → Actions
+   → Variables) — non-secret identifiers your platform admin hands you:
+   `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `ACR_NAME`.
+   The GitOps App credentials are org secrets, inherited automatically.
+3. **Onboard the service in `platform-gitops`.** Add `apps/<service>/`
+   (Deployment + Service + kustomization) and `apps/<service>.yaml`; the pipeline
+   opens its promotion PR against that path.
+4. **Push.** The pipeline runs end to end (see the flow below).
+5. **Merge the promotion PR.** ArgoCD syncs it, Kyverno verifies the signature +
+   SBOM + provenance at admission, and your pod runs.
+
+You never touched Sigstore, cosign, or a Dockerfile flag. If a step fails, the
+pipeline prints *what* failed, *why it matters*, and the *exact* next step.
+
+```mermaid
+flowchart LR
+  push["git push"] --> test["lint + test"] --> sast["Semgrep"] --> sca["Trivy"]
+  sca --> build["build<br/>distroless"] --> sbom["SBOM"] --> sign["cosign<br/>sign"] --> prov["SLSA<br/>provenance"]
+  prov --> acr[("push ACR")] --> pr["promotion PR →<br/>platform-gitops"]
+  pr --> merge(("you<br/>merge")) --> argo["ArgoCD sync"] --> kyv{"Kyverno<br/>verify"}
+  kyv -->|"signed"| run["✅ Pod running"]
+  kyv -->|"unsigned"| reject["❌ Rejected"]
+```
+
+> **Proof it works:** `weather-api` (Python) and `sample-service` (Go) were both
+> onboarded exactly this way and run in the cluster, admitted by Kyverno.
+
 ## Quickstart
 
 Either click **Use this template** on [`templates/service-go`](templates/service-go)
